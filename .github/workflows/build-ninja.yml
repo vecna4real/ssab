@@ -1,0 +1,104 @@
+name: Build SSAB (Ninja fallback)
+
+# This is a fallback workflow that uses the Ninja generator instead
+# of the Visual Studio generator. Use this if the main build.yml fails
+# with "No CMAKE_C_COMPILER could be found" or generator detection errors.
+#
+# To use: go to Actions tab → "Build SSAB (Ninja fallback)" → Run workflow.
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows-ninja:
+    name: Build on Windows (Ninja + MSVC)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ----------------------------------------------------------------
+      # 1. Use microsoft/setup-msbuild to find VS 2022 + activate the
+      #    Developer Command Prompt environment variables.
+      # ----------------------------------------------------------------
+      - name: Setup MSVC dev environment
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+          vs-version: '17'
+
+      # ----------------------------------------------------------------
+      # 2. Install Ninja via the official action. Ninja is a fast
+      #    single-file build system that's much simpler than VS solutions.
+      # ----------------------------------------------------------------
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+        with:
+          version: '1.11.1'
+
+      - name: Print tool versions
+        shell: pwsh
+        run: |
+          Write-Host "=== CMake ==="
+          cmake --version
+          Write-Host "=== Ninja ==="
+          ninja --version
+          Write-Host "=== MSBuild ==="
+          msbuild -version
+
+      # ----------------------------------------------------------------
+      # 3. Configure with Ninja generator + MSVC compiler.
+      #    We call vcvarsall.bat via the "shell: cmd" so that the MSVC
+      #    environment is set up before cmake runs.
+      # ----------------------------------------------------------------
+      - name: Configure (CMake + Ninja)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          mkdir build
+          cd build
+          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DSSAB_ENABLE_VST2=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+
+      - name: Build (Release)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build build --parallel
+
+      - name: List artefacts
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path build -Recurse -Include *.dll,*.vst3,*.exe -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "Found: $($_.FullName) ($($_.Length) bytes)" }
+
+      - name: Stage artefacts
+        shell: pwsh
+        run: |
+          $out = "staging"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $vst = Get-ChildItem -Path build -Recurse -Filter "SSAB.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($vst) { Copy-Item $vst.FullName -Destination "$out/SSAB.dll" }
+          $vst3 = Get-ChildItem -Path build -Recurse -Filter "SSAB.vst3" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($vst3) {
+            New-Item -ItemType Directory -Force -Path "$out/SSAB.vst3" | Out-Null
+            Copy-Item -Path "$($vst3.FullName)/*" -Destination "$out/SSAB.vst3" -Recurse -Force
+          }
+          $exe = Get-ChildItem -Path build -Recurse -Filter "SSAB.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) { Copy-Item $exe.FullName -Destination "$out/SSAB.exe" }
+          Compress-Archive -Path staging/* -DestinationPath SSAB_windows_build.zip -Force
+          Get-ChildItem -Path staging -Recurse | ForEach-Object { Write-Host $_.FullName }
+
+      - name: Upload VST2 .dll (for LMMS)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSAB_VST2_dll_ninja
+          path: staging/SSAB.dll
+          if-no-files-found: warn
+
+      - name: Upload full zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSAB_windows_build_zip_ninja
+          path: SSAB_windows_build.zip
+          if-no-files-found: warn

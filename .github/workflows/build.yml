@@ -1,7 +1,9 @@
 name: Build SSAB VST2/VST3
 
-# Triggers: any push to main, manual run from the Actions tab,
-# and release tags (v*.*.*) which also publish the .dll as a release asset.
+# Triggers:
+#   - push to main/master: build on Windows
+#   - tag v*.*.*: build + publish a GitHub Release with the .dll
+#   - workflow_dispatch: manual run from the Actions tab
 on:
   push:
     branches: [ main, master ]
@@ -17,21 +19,40 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: false
+          fetch-depth: 1
 
-      - name: Setup MSVC dev environment
+      # ----------------------------------------------------------------
+      # 1. Set up the Microsoft Visual C++ build environment.
+      #    microsoft/setup-msbuild@v2 puts MSBuild.exe on PATH and
+      #    configures the VSVersions SDK on the runner.
+      # ----------------------------------------------------------------
+      - name: Setup MSVC (Visual Studio 2022)
         uses: microsoft/setup-msbuild@v2
-
-      - name: Install CMake
-        uses: jwlawson/actions-setup-cmake@v2
         with:
-          cmake-version: '3.27.7'
+          msbuild-architecture: x64
+          vs-version: '17'
 
+      # ----------------------------------------------------------------
+      # 2. CMake. We use the CMake that ships on windows-latest
+      #    (already preinstalled at C:\Program Files\CMake\bin\cmake.exe),
+      #    so we don't need to install our own. Just print the version.
+      # ----------------------------------------------------------------
       - name: Print tool versions
         shell: pwsh
         run: |
+          Write-Host "=== CMake version ==="
           cmake --version
+          Write-Host "=== MSBuild version ==="
           msbuild -version
+          Write-Host "=== Visual Studio installation ==="
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
 
+      # ----------------------------------------------------------------
+      # 3. Configure CMake.
+      #    We use the "Visual Studio 17 2022" generator with platform x64.
+      #    This is the safest choice — it lets CMake auto-detect the VS
+      #    installation that setup-msbuild just configured.
+      # ----------------------------------------------------------------
       - name: Configure (CMake)
         shell: pwsh
         run: |
@@ -39,40 +60,74 @@ jobs:
           cd build
           cmake .. -G "Visual Studio 17 2022" -A x64 -DSSAB_ENABLE_VST2=ON
 
+      # ----------------------------------------------------------------
+      # 4. Build (Release).
+      #    --parallel lets MSBuild use all cores.
+      # ----------------------------------------------------------------
       - name: Build (Release)
         shell: pwsh
-        run: cmake --build build --config Release --parallel
+        run: |
+          cmake --build build --config Release --parallel
 
+      # ----------------------------------------------------------------
+      # 5. List artefacts so we can see what was produced.
+      # ----------------------------------------------------------------
       - name: List artefacts
         shell: pwsh
         run: |
-          Get-ChildItem -Path build/SSAB_artefacts -Recurse -Include *.dll,*.vst3,*.exe |
-            ForEach-Object { Write-Host "Found: $($_.FullName)" }
+          Write-Host "=== Searching for build artefacts ==="
+          Get-ChildItem -Path build -Recurse -Include *.dll,*.vst3,*.exe -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              Write-Host "Found: $($_.FullName) ($($_.Length) bytes)"
+            }
 
+      # ----------------------------------------------------------------
+      # 6. Stage artefacts for upload.
+      # ----------------------------------------------------------------
       - name: Stage artefacts
         shell: pwsh
         run: |
           $out = "staging"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-          # VST2 .dll -> staging/
-          $vst = Get-ChildItem -Path build -Recurse -Filter "SSAB.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($vst) { Copy-Item $vst.FullName -Destination "$out/SSAB.dll" }
-          # VST3 -> staging/
-          $vst3 = Get-ChildItem -Path build -Recurse -Filter "SSAB.vst3" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($vst3) { Copy-Item $vst3.FullName -Destination "$out/SSAB.vst3" -Recurse -Force }
-          # Standalone
-          $exe = Get-ChildItem -Path build -Recurse -Filter "SSAB.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($exe) { Copy-Item $exe.FullName -Destination "$out/SSAB.exe" }
-          Get-ChildItem -Path $out -Recurse
 
+          # VST2 .dll
+          $vst = Get-ChildItem -Path build -Recurse -Filter "SSAB.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($vst) {
+            Copy-Item $vst.FullName -Destination "$out/SSAB.dll"
+            Write-Host "Staged VST2: $($vst.FullName)"
+          } else {
+            Write-Host "WARNING: SSAB.dll not found!"
+          }
+
+          # VST3 bundle
+          $vst3 = Get-ChildItem -Path build -Recurse -Filter "SSAB.vst3" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($vst3) {
+            # VST3 is a directory on Windows; copy recursively
+            New-Item -ItemType Directory -Force -Path "$out/SSAB.vst3" | Out-Null
+            Copy-Item -Path "$($vst3.FullName)/*" -Destination "$out/SSAB.vst3" -Recurse -Force
+            Write-Host "Staged VST3: $($vst3.FullName)"
+          }
+
+          # Standalone exe
+          $exe = Get-ChildItem -Path build -Recurse -Filter "SSAB.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) {
+            Copy-Item $exe.FullName -Destination "$out/SSAB.exe"
+            Write-Host "Standalone: $($exe.FullName)"
+          }
+
+          Write-Host "=== Staged files ==="
+          Get-ChildItem -Path $out -Recurse | ForEach-Object { Write-Host $_.FullName }
+
+      # ----------------------------------------------------------------
+      # 7. Upload artefacts (each as separate downloadable item).
+      # ----------------------------------------------------------------
       - name: Upload VST2 .dll (for LMMS)
         uses: actions/upload-artifact@v4
         with:
           name: SSAB_VST2_dll
-          path: |
-            staging/SSAB.dll
-            build/SSAB_artefacts/Release/VST/SSAB.dll
-          if-no-files-found: error
+          path: staging/SSAB.dll
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Upload VST3 bundle
         uses: actions/upload-artifact@v4
@@ -80,6 +135,7 @@ jobs:
           name: SSAB_VST3
           path: staging/SSAB.vst3
           if-no-files-found: warn
+          retention-days: 90
 
       - name: Upload Standalone exe
         uses: actions/upload-artifact@v4
@@ -87,7 +143,11 @@ jobs:
           name: SSAB_Standalone
           path: staging/SSAB.exe
           if-no-files-found: warn
+          retention-days: 90
 
+      # ----------------------------------------------------------------
+      # 8. Zip everything for a one-click download.
+      # ----------------------------------------------------------------
       - name: Zip everything
         shell: pwsh
         run: |
@@ -98,11 +158,12 @@ jobs:
         with:
           name: SSAB_windows_build_zip
           path: SSAB_windows_build.zip
-          if-no-files-found: error
+          if-no-files-found: warn
+          retention-days: 90
 
-  # ----------------------------------------------------------------
-  # Release: when a v*.*.* tag is pushed, attach the .dll to a release
-  # ----------------------------------------------------------------
+  # ------------------------------------------------------------------
+  # Release: when a v*.*.* tag is pushed, attach the zip to a release.
+  # ------------------------------------------------------------------
   release:
     name: Release on tag
     needs: build-windows

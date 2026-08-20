@@ -1,0 +1,73 @@
+name: Diagnose Runner
+
+# Manual workflow that just prints what's installed on the Windows runner.
+# Use this if build.yml and build-ninja.yml both fail — the output will
+# show exactly what compilers / CMake / VS installations are available.
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    name: Print Windows runner environment
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Print environment
+        shell: pwsh
+        run: |
+          Write-Host "=== OS ==="
+          Get-ComputerInfo | Select-Object OsName, OsVersion, OsArchitecture
+          Write-Host ""
+          Write-Host "=== PATH ==="
+          $env:PATH -split ';' | ForEach-Object { Write-Host $_ }
+          Write-Host ""
+          Write-Host "=== CMake (default) ==="
+          cmake --version
+          Write-Host ""
+          Write-Host "=== Where is cmake ==="
+          Get-Command cmake -ErrorAction SilentlyContinue | Format-List
+          Write-Host ""
+          Write-Host "=== Where is msbuild ==="
+          Get-Command msbuild -ErrorAction SilentlyContinue | Format-List
+          Write-Host ""
+          Write-Host "=== Visual Studio installations (vswhere) ==="
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            & $vswhere -all -format json | ConvertFrom-Json | ForEach-Object {
+              Write-Host "Instance: $($_.installationPath)"
+              Write-Host "  Version: $($_.installationVersion)"
+              Write-Host "  DisplayName: $($_.displayName)"
+            }
+          } else {
+            Write-Host "vswhere not found!"
+          }
+          Write-Host ""
+          Write-Host "=== CMake generators available ==="
+          cmake --help | Select-String -Pattern "Generators" -Context 0,30
+
+      - name: Setup MSVC
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+          vs-version: '17'
+
+      - name: Print environment after MSVC setup
+        shell: pwsh
+        run: |
+          Write-Host "=== After setup-msbuild ==="
+          Write-Host "vswhere:"
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Write-Host ""
+          Write-Host "=== MSBuild ==="
+          msbuild -version
+          Write-Host ""
+          Write-Host "=== Test CMake configure ==="
+          mkdir test_build -Force
+          cd test_build
+          try {
+            cmake .. -G "Visual Studio 17 2022" -A x64 2>&1 | Out-String | Write-Host
+          } catch {
+            Write-Host "ERROR: $_"
+          }
