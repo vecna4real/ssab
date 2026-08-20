@@ -1,1 +1,126 @@
-ee
+name: Build SSAB VST2/VST3
+
+# Triggers: any push to main, manual run from the Actions tab,
+# and release tags (v*.*.*) which also publish the .dll as a release asset.
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*.*.*' ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build on Windows (VST2 + VST3 + Standalone)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Setup MSVC dev environment
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.27.7'
+
+      - name: Print tool versions
+        shell: pwsh
+        run: |
+          cmake --version
+          msbuild -version
+
+      - name: Configure (CMake)
+        shell: pwsh
+        run: |
+          mkdir build -Force
+          cd build
+          cmake .. -G "Visual Studio 17 2022" -A x64 -DSSAB_ENABLE_VST2=ON
+
+      - name: Build (Release)
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: List artefacts
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path build/SSAB_artefacts -Recurse -Include *.dll,*.vst3,*.exe |
+            ForEach-Object { Write-Host "Found: $($_.FullName)" }
+
+      - name: Stage artefacts
+        shell: pwsh
+        run: |
+          $out = "staging"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          # VST2 .dll -> staging/
+          $vst = Get-ChildItem -Path build -Recurse -Filter "SSAB.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($vst) { Copy-Item $vst.FullName -Destination "$out/SSAB.dll" }
+          # VST3 -> staging/
+          $vst3 = Get-ChildItem -Path build -Recurse -Filter "SSAB.vst3" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($vst3) { Copy-Item $vst3.FullName -Destination "$out/SSAB.vst3" -Recurse -Force }
+          # Standalone
+          $exe = Get-ChildItem -Path build -Recurse -Filter "SSAB.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) { Copy-Item $exe.FullName -Destination "$out/SSAB.exe" }
+          Get-ChildItem -Path $out -Recurse
+
+      - name: Upload VST2 .dll (for LMMS)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSAB_VST2_dll
+          path: |
+            staging/SSAB.dll
+            build/SSAB_artefacts/Release/VST/SSAB.dll
+          if-no-files-found: error
+
+      - name: Upload VST3 bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSAB_VST3
+          path: staging/SSAB.vst3
+          if-no-files-found: warn
+
+      - name: Upload Standalone exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSAB_Standalone
+          path: staging/SSAB.exe
+          if-no-files-found: warn
+
+      - name: Zip everything
+        shell: pwsh
+        run: |
+          Compress-Archive -Path staging/* -DestinationPath SSAB_windows_build.zip -Force
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSAB_windows_build_zip
+          path: SSAB_windows_build.zip
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Release: when a v*.*.* tag is pushed, attach the .dll to a release
+  # ----------------------------------------------------------------
+  release:
+    name: Release on tag
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download zip artefact
+        uses: actions/download-artifact@v4
+        with:
+          name: SSAB_windows_build_zip
+          path: release
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
