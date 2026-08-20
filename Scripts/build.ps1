@@ -74,8 +74,28 @@ if ($UseNinja) {
         $vsPath    = & $vswhere -latest -property installationPath
 
         if ($vsVersion) {
-            $vsMajor = $vsVersion.Split('.')[0]
-            $vsYear  = [int]::Parse($vsMajor) + 2005
+            $vsMajor = [int]::Parse($vsVersion.Split('.')[0])
+
+            # Known VS major -> year mapping.
+            # Microsoft breaks the "major + 2005" pattern starting at VS 18
+            # (17->2022, 18->2026), so use an explicit map.
+            $yearMap = @{
+                14 = 2015
+                15 = 2017
+                16 = 2019
+                17 = 2022
+                18 = 2026
+                19 = 2029
+                20 = 2032
+            }
+            if ($yearMap.ContainsKey($vsMajor)) {
+                $vsYear = $yearMap[$vsMajor]
+            } else {
+                # Fallback: try major + 2005 (might be wrong, but worth a shot)
+                $vsYear = $vsMajor + 2005
+                Write-Host "WARNING: VS major $vsMajor not in known map. Guessing $vsYear." -ForegroundColor Yellow
+            }
+
             $generatorName = "Visual Studio $vsMajor $vsYear"
 
             Write-Host "Visual Studio detected:" -ForegroundColor Cyan
@@ -83,6 +103,18 @@ if ($UseNinja) {
             Write-Host "  Major:      $vsMajor" -ForegroundColor Gray
             Write-Host "  Path:       $vsPath" -ForegroundColor Gray
             Write-Host "  Generator:  $generatorName" -ForegroundColor Gray
+
+            # Sanity check: does CMake actually know this generator?
+            $helpOutput = cmake --help | Out-String
+            if ($helpOutput -notmatch [regex]::Escape($generatorName)) {
+                Write-Host "WARNING: CMake does not list generator '$generatorName'." -ForegroundColor Yellow
+                Write-Host "Falling back to 'Visual Studio 17 2022'." -ForegroundColor Yellow
+                $generatorName = "Visual Studio 17 2022"
+                if ($helpOutput -notmatch [regex]::Escape($generatorName)) {
+                    Write-Host "WARNING: VS 2022 generator also missing. Using Ninja." -ForegroundColor Yellow
+                    $generatorName = "Ninja"
+                }
+            }
         } else {
             Write-Host "ERROR: vswhere didn't return a Visual Studio version." -ForegroundColor Red
             Write-Host "Is Visual Studio installed with the C++ workload?" -ForegroundColor Yellow
