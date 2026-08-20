@@ -117,15 +117,36 @@ git push -u origin main
 
 ### Шаг 3: Запусти workflow
 
+В проекте теперь **три** workflow:
+
+| Workflow | Файл | Когда использовать |
+|----------|------|---------------------|
+| **Build SSAB VST2/VST3** | `build.yml` | Основной. Запускается автоматически на push. Использует "Visual Studio 17 2022" генератор. |
+| **Build SSAB (Ninja fallback)** | `build-ninja.yml` | Ручной запуск. Использует Ninja генератор с явным MSVC toolchain. Используй если основной падает. |
+| **Diagnose Runner** | `diagnose.yml` | Ручной запуск. Печатает что установлено на runner'е (VS, CMake, generator'ы). Используй если не понимаешь причину ошибки. |
+
+**Для стандартной сборки:**
+
 1. В репо перейди на вкладку **Actions**.
-2. Слева в списке workflows выбери **Build SSAB VST2/VST3**.
-3. Если workflow не запустился автоматически — нажми **I understand my workflows, go ahead and enable them** (для новых репо).
-4. Нажми жёлтую кнопку **Run workflow** справа → **Run workflow**.
-5. Жди. Сборка занимает **5-8 минут**:
+2. Если workflows не видны — нажми **I understand my workflows, go ahead and enable them** (для новых репо).
+3. Workflow **Build SSAB VST2/VST3** запустится автоматически после push.
+4. Жди. Сборка занимает **5-8 минут**:
    - 1 мин — Download JUCE 7.0.12 + VST2 stub headers
    - 1 мин — CMake configure
    - 4 мин — Build (Visual Studio 2022 / Release / x64)
    - 30 сек — Stage + upload artifacts
+
+**Если основной workflow упал с ошибкой генератора:**
+
+1. Перейди на **Actions** → **Build SSAB (Ninja fallback)** → **Run workflow**.
+2. Этот вариант использует `vcvars64.bat` + Ninja, что более переносимо.
+3. Жди 5-8 минут, скачай артефакт `SSAB_VST2_dll_ninja`.
+
+**Если оба упали:**
+
+1. Перейди на **Actions** → **Diagnose Runner** → **Run workflow**.
+2. Прочитай output — там будет полный список что установлено на runner'е.
+3. Пришли мне точный текст ошибки (или скриншот output'а diagnose workflow).
 
 ### Шаг 4: Скачай .dll
 
@@ -145,22 +166,59 @@ git push -u origin main
 5. В панели Vestige нажми иконку папки → выбери `SSAB.dll`.
 6. Откроется GUI SSAB со всеми 7 блоками и 18 пресетами.
 
-### Что делает workflow
+### Что делает каждый workflow
 
-Файл `.github/workflows/build.yml` делает следующее:
-
+**`build.yml`** (основной):
 1. Поднимает `windows-latest` runner (Windows Server 2022).
 2. Ставит MSVC v143 через `microsoft/setup-msbuild@v2`.
-3. Ставит CMake 3.27.7 через `jwlawson/actions-setup-cmake@v2`.
-4. Скачивает JUCE 7.0.12 с GitHub (CMake FetchContent).
-5. Скачивает VST2 stub headers с `robbert-vdh/juce6-vst2-headers`.
-6. Запускает `cmake .. -G "Visual Studio 17 2022" -A x64 -DSSAB_ENABLE_VST2=ON`.
-7. Запускает `cmake --build . --config Release --parallel`.
-8. Загружает артефакты:
+3. Использует CMake, предустановленный на runner'е (НЕ ставит свой).
+4. Запускает `cmake .. -G "Visual Studio 17 2022" -A x64 -DSSAB_ENABLE_VST2=ON`.
+5. Скачивает JUCE 7.0.12 + VST2 stub headers через FetchContent.
+6. Запускает `cmake --build . --config Release --parallel`.
+7. Загружает 4 артефакта:
    - `SSAB_VST2_dll` — только VST2 .dll
    - `SSAB_VST3` — VST3 bundle
    - `SSAB_Standalone` — standalone .exe
    - `SSAB_windows_build_zip` — всё в одном zip
+
+**`build-ninja.yml`** (фолбэк):
+1. Поднимает `windows-latest` runner.
+2. Активирует MSVC через `microsoft/setup-msbuild@v2`.
+3. Ставит Ninja 1.11.1 через `seanmiddleditch/gha-setup-ninja@v5`.
+4. Запускает `vcvars64.bat` для активации cl.exe в PATH.
+5. Конфигурирует с `-G Ninja -DCMAKE_BUILD_TYPE=Release`.
+6. Собирает, загружает артефакты.
+
+**`diagnose.yml`** (отладка):
+1. Печатает версии OS, CMake, MSBuild.
+2. Запускает `vswhere.exe` чтобы показать установленные VS.
+3. Печатает список доступных CMake generators.
+4. Пробует сконфигурировать тестовый проект.
+
+### Почему у тебя могло не сработать (если первый workflow упал)
+
+**Причина:** На GitHub Actions runner'е `windows-latest` сейчас стоит **Visual Studio 18 (2026 Preview)**, а не VS 2022 (17). Старая версия workflow жёстко задавала генератор `"Visual Studio 17 2022"`, который не находил VS на runner'е и падал с ошибкой:
+
+```
+CMake Error at CMakeLists.txt:3 (project):
+  Generator
+    Visual Studio 17 2022
+  could not find any instance of Visual Studio.
+```
+
+**Решение в новой версии workflow:**
+
+Workflow теперь использует `vswhere.exe` для автоматического определения установленной версии Visual Studio и собирает имя генератора динамически:
+
+```powershell
+$vsVersion = & $vswhere -latest -property installationVersion
+$vsMajor   = $vsVersion.Split('.')[0]
+$genName   = "Visual Studio $vsMajor $([int]::Parse($vsMajor) + 2005)"
+```
+
+Это работает на любой версии Visual Studio (17/2022, 18/2026, и будущих). Если Microsoft снова обновит runner — workflow автоматически подхватит новую версию.
+
+Если Copilot сказал, что проблема в `project()` — это был неверный диагноз. CMake `project()` синтаксически правильный, ошибка была на стороне генератора.
 
 ### Создание релиза
 
@@ -172,13 +230,6 @@ git push origin v1.0.0
 ```
 
 Workflow автоматически создаст GitHub Release с прикреплённым zip'ом.
-
-### Ограничения GitHub Actions
-
-- Бесплатный лимит для публичных репо: 2000 минут/месяц.
-- Один билд = ~10 минут, так что ~200 билдов в месяц бесплатно.
-- Файлы артефактов хранятся 90 дней (потом автоматически удаляются).
-- Для приватных репо лимит 2000 минут/месяц, после — $0.008/мин.
 
 ---
 
@@ -213,32 +264,46 @@ Workflow автоматически создаст GitHub Release с прикр�
 
 Распакуй `SSAB_LMMS_pack.zip` куда-нибудь, например в `C:\Users\твой-логин\Documents\SSAB`.
 
+**Стандартный путь (VS 2022 generator):**
 ```powershell
 cd C:\Users\твой-логин\Documents\SSAB
-
-# Запусти build-скрипт
 .\Scripts\build.ps1
 ```
 
-Скрипт делает следующее:
-1. Проверяет наличие cmake и msbuild.
-2. Создаёт папку `build/`.
-3. Запускает `cmake .. -G "Visual Studio 17 2022" -A x64 -DSSAB_ENABLE_VST2=ON`.
-4. CMake скачивает JUCE 7.0.12 (~200 MB, может занять пару минут).
-5. CMake скачивает VST2 stub headers (~50 KB).
-6. Запускает сборку (`cmake --build . --config Release -j`).
-7. Показывает пути к артефактам.
-
-**Если хочешь собрать только VST3 (без VST2):**
+**Если не работает (поставь Ninja):**
 ```powershell
-.\Scripts\build.ps1 -DisableVST2
-```
-(нужно добавить этот флаг в скрипт, либо убрать `-DSSAB_ENABLE_VST2=ON`)
+# Вариант 1: через chocolatey (если установлен)
+choco install ninja
 
-**Если нужно очистить и пересобрать:**
-```powershell
-.\Scripts\build.ps1 -Clean
+# Вариант 2: через pip (если Python установлен)
+pip install ninja
+
+# Затем:
+.\Scripts\build.ps1 -UseNinja
 ```
+
+**Скрипт делает следующее:**
+1. Проверяет наличие cmake и печатает версию.
+2. Ищет Visual Studio через `vswhere.exe`.
+3. (Опционально) использует Ninja вместо VS generator.
+4. Создаёт папку `build/`.
+5. Запускает `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DSSAB_ENABLE_VST2=ON`.
+6. CMake скачивает JUCE 7.0.12 (~200 MB, может занять пару минут).
+7. CMake скачивает VST2 stub headers (~50 KB).
+8. Запускает сборку (`cmake --build build --config Release --parallel`).
+9. Показывает пути к артефактам и инструкции по установке.
+
+**Флаги build.ps1:**
+
+| Флаг | Описание |
+|------|----------|
+| `-DisableVST2` | Не собирать VST2 (только VST3 + Standalone) |
+| `-UseNinja` | Использовать Ninja вместо VS generator (быстрее, не требует VS solution) |
+| `-Clean` | Удалить `build/` перед конфигурацией |
+| `-Verbose` | Подробный вывод CMake |
+| `-VSGenerator <name>` | Явно указать генератор (напр. `"Visual Studio 17 2022"`). По умолчанию автоопределение через vswhere. |
+
+Локальный скрипт также автоматически определяет версию VS через `vswhere.exe` и собирает имя генератора динамически. Если у тебя на машине стоит VS 2026 (18) — он сам подставит `"Visual Studio 18 2026"`.
 
 ### Шаг 4: Где лежат собранные бинари
 
