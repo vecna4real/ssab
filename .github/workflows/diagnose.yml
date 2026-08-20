@@ -1,6 +1,6 @@
 name: Diagnose Runner
 
-# Manual workflow that just prints what's installed on the Windows runner.
+# Manual workflow that prints what's installed on the Windows runner.
 # Use this if build.yml and build-ninja.yml both fail — the output will
 # show exactly what compilers / CMake / VS installations are available.
 on:
@@ -20,9 +20,6 @@ jobs:
           Write-Host "=== OS ==="
           Get-ComputerInfo | Select-Object OsName, OsVersion, OsArchitecture
           Write-Host ""
-          Write-Host "=== PATH ==="
-          $env:PATH -split ';' | ForEach-Object { Write-Host $_ }
-          Write-Host ""
           Write-Host "=== CMake (default) ==="
           cmake --version
           Write-Host ""
@@ -35,39 +32,71 @@ jobs:
           Write-Host "=== Visual Studio installations (vswhere) ==="
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           if (Test-Path $vswhere) {
+            Write-Host "All VS installations:"
             & $vswhere -all -format json | ConvertFrom-Json | ForEach-Object {
-              Write-Host "Instance: $($_.installationPath)"
-              Write-Host "  Version: $($_.installationVersion)"
-              Write-Host "  DisplayName: $($_.displayName)"
+              Write-Host "  Instance: $($_.installationPath)"
+              Write-Host "    Version: $($_.installationVersion)"
+              Write-Host "    DisplayName: $($_.displayName)"
+              Write-Host "    ProductDisplayVersion: $($_.catalog_productDisplayVersion)"
             }
+            Write-Host ""
+            Write-Host "Latest VS:"
+            $latest = & $vswhere -latest -format json | ConvertFrom-Json
+            Write-Host "  Path:    $($latest.installationPath)"
+            Write-Host "  Version: $($latest.installationVersion)"
+            $vsMajor = $latest.installationVersion.Split('.')[0]
+            $vsYear  = [int]::Parse($vsMajor) + 2005
+            Write-Host "  Major:   $vsMajor"
+            Write-Host "  Year:    $vsYear"
+            $genName = "Visual Studio $vsMajor $vsYear"
+            Write-Host "  -> Suggested CMake generator: $genName"
           } else {
-            Write-Host "vswhere not found!"
+            Write-Host "vswhere.exe not found!"
           }
           Write-Host ""
           Write-Host "=== CMake generators available ==="
-          cmake --help | Select-String -Pattern "Generators" -Context 0,30
+          cmake --help | Select-String -Pattern "^\s+(Visual Studio|Ninja|Unix Makefiles|MSYS|Borland)" | ForEach-Object { Write-Host $_.Line }
 
       - name: Setup MSVC
         uses: microsoft/setup-msbuild@v2
         with:
           msbuild-architecture: x64
-          vs-version: '17'
 
-      - name: Print environment after MSVC setup
+      - name: Test CMake configure with auto-detected generator
         shell: pwsh
         run: |
           Write-Host "=== After setup-msbuild ==="
-          Write-Host "vswhere:"
-          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Write-Host "vswhere latest:"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          & $vswhere -latest -property installationPath
           Write-Host ""
-          Write-Host "=== MSBuild ==="
+          Write-Host "MSBuild:"
           msbuild -version
           Write-Host ""
-          Write-Host "=== Test CMake configure ==="
+          Write-Host "=== Test CMake configure with auto-detected generator ==="
+
+          $vsVersion = & $vswhere -latest -property installationVersion
+          $vsMajor   = $vsVersion.Split('.')[0]
+          $vsYear    = [int]::Parse($vsMajor) + 2005
+          $genName   = "Visual Studio $vsMajor $vsYear"
+          Write-Host "Using generator: $genName"
+
           mkdir test_build -Force
           cd test_build
           try {
-            cmake .. -G "Visual Studio 17 2022" -A x64 2>&1 | Out-String | Write-Host
+            cmake .. -G "$genName" -A x64 2>&1 | Out-String | Write-Host
+            Write-Host "SUCCESS: CMake configured with $genName"
           } catch {
             Write-Host "ERROR: $_"
+            Write-Host "Trying without -G flag (let CMake auto-pick)..."
+            cd ..
+            Remove-Item -Recurse -Force test_build
+            mkdir test_build -Force
+            cd test_build
+            try {
+              cmake .. -A x64 2>&1 | Out-String | Write-Host
+              Write-Host "SUCCESS: CMake configured with default generator"
+            } catch {
+              Write-Host "ERROR: $_"
+            }
           }
