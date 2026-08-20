@@ -23,9 +23,7 @@ jobs:
 
       # ----------------------------------------------------------------
       # 1. Set up the Microsoft Visual C++ build environment.
-      #    DON'T pin vs-version — let it find whatever VS is on the runner.
-      #    On windows-latest as of late 2025 this is VS 18 (2026 Preview),
-      #    but it could change. setup-msbuild handles this automatically.
+      #    Don't pin vs-version — let it auto-detect.
       # ----------------------------------------------------------------
       - name: Setup MSVC
         uses: microsoft/setup-msbuild@v2
@@ -33,9 +31,15 @@ jobs:
           msbuild-architecture: x64
 
       # ----------------------------------------------------------------
-      # 2. Print tool versions and find VS installation path.
+      # 2. Discover installed Visual Studio + pick the correct CMake
+      #    generator name. Microsoft doesn't follow a strict
+      #    "major + offset" naming convention, so we use an explicit
+      #    map: VS 17 -> 2022, VS 18 -> 2026, etc. We also query
+      #    `cmake --help` and pick the matching generator from what
+      #    CMake actually supports on this runner.
       # ----------------------------------------------------------------
-      - name: Print tool versions + find VS
+      - name: Detect Visual Studio and CMake generator
+        id: detect
         shell: pwsh
         run: |
           Write-Host "=== CMake version ==="
@@ -44,63 +48,99 @@ jobs:
           Write-Host "=== MSBuild version ==="
           msbuild -version
           Write-Host ""
-          Write-Host "=== Visual Studio installations (vswhere) ==="
+
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (Test-Path $vswhere) {
-            & $vswhere -latest -property installationPath
-            Write-Host "VS version:"
-            & $vswhere -latest -property installationVersion
-            Write-Host "VS catalog:"
-            & $vswhere -latest -property catalog_productDisplayVersion
-          } else {
-            Write-Host "vswhere.exe not found!"
+          if (-not (Test-Path $vswhere)) {
+            Write-Host "FATAL: vswhere.exe not found." -ForegroundColor Red
+            exit 1
           }
+
+          $vsPath    = & $vswhere -latest -property installationPath
+          $vsVersion  = & $vswhere -latest -property installationVersion
+          $vsMajor    = [int]::Parse($vsVersion.Split('.')[0])
+          $vsYear     = $null
+
+          # Known VS major -> year mapping.
+          # Microsoft breaks the "major + 2005" pattern starting at VS 18.
+          $yearMap = @{
+            14 = 2015
+            15 = 2017
+            16 = 2019
+            17 = 2022
+            18 = 2026
+            19 = 2029  # educated guess for future VS
+            20 = 2032
+          }
+          if ($yearMap.ContainsKey($vsMajor)) {
+            $vsYear = $yearMap[$vsMajor]
+          } else {
+            # Fallback: try major + 2005
+            $vsYear = $vsMajor + 2005
+          }
+          $genName = "Visual Studio $vsMajor $vsYear"
+          Write-Host "Detected VS path:    $vsPath"
+          Write-Host "Detected VS version: $vsVersion"
+          Write-Host "VS major:            $vsMajor"
+          Write-Host "VS year:             $vsYear"
+          Write-Host "Candidate generator: $genName"
           Write-Host ""
-          Write-Host "=== Available CMake generators ==="
-          cmake --help | Select-String -Pattern "^\s+(Visual Studio|Ninja|Unix Makefiles|MSYS)" | ForEach-Object { Write-Host $_.Line }
+
+          # Sanity-check: does CMake actually know this generator?
+          $helpOutput = cmake --help | Out-String
+          if ($helpOutput -notmatch [regex]::Escape($genName)) {
+            Write-Host "WARNING: CMake does not list generator '$genName'." -ForegroundColor Yellow
+            Write-Host "Trying fallback: Visual Studio 17 2022"
+            $genName = "Visual Studio 17 2022"
+            if ($helpOutput -notmatch [regex]::Escape($genName)) {
+              Write-Host "WARNING: VS 2022 generator also missing. Using Ninja." -ForegroundColor Yellow
+              $genName = "Ninja"
+            }
+          }
+          Write-Host "Selected generator:  $genName" -ForegroundColor Cyan
+
+          # Save for next step (as step output + env var).
+          "GEN_NAME=$genName" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Final: GEN_NAME=$genName"
 
       # ----------------------------------------------------------------
-      # 3. Configure CMake with AUTO-DETECT generator.
-      #    We do NOT pass -G "Visual Studio 17 2022" because:
-      #      - On old runners: it works.
-      #      - On windows-latest (2025+): VS 17 is gone, only VS 18
-      #        exists. The "Visual Studio 17 2022" generator then fails
-      #        with "could not find any instance of Visual Studio".
-      #
-      #    Instead we use vswhere to discover the VS major version
-      #    installed, then build the generator name dynamically.
+      # 3. Configure CMake with the discovered generator.
+      #    Ninja is a single-config generator (no -A flag, no --config).
+      #    VS generators are multi-config (-A x64 + --config Release).
       # ----------------------------------------------------------------
-      - name: Configure (CMake with auto-detected VS generator)
+      - name: Configure (CMake)
         shell: pwsh
         run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsVersion = & $vswhere -latest -property installationVersion
-          $vsMajor = $vsVersion.Split('.')[0]
-          Write-Host "Detected Visual Studio major version: $vsMajor"
-          Write-Host "Full version: $vsVersion"
-
-          # Map VS major -> CMake generator name
-          # VS 17 = "Visual Studio 17 2022"
-          # VS 18 = "Visual Studio 18 2026" (preview)
-          # VS 19+ = future, hopefully follows the pattern
-          $genName = "Visual Studio $vsMajor $([int]::Parse($vsMajor) + 2005)"
-          Write-Host "Using generator: $genName"
-
-          mkdir build -Force
-          cd build
-          cmake .. -G "$genName" -A x64 -DSSAB_ENABLE_VST2=ON
+          Write-Host "Using generator: $env:GEN_NAME"
+          if ($env:GEN_NAME -eq "Ninja") {
+            & cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DSSAB_ENABLE_VST2=ON
+          } else {
+            & cmake -S . -B build -G "$env:GEN_NAME" -A x64 -DSSAB_ENABLE_VST2=ON
+          }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "ERROR: CMake configure failed with exit code $LASTEXITCODE" -ForegroundColor Red
+            exit 1
+          }
 
       # ----------------------------------------------------------------
       # 4. Build (Release).
-      #    --parallel lets MSBuild use all cores.
+      #    For Ninja (single-config), we omit --config since
+      #    CMAKE_BUILD_TYPE=Release is already set.
       # ----------------------------------------------------------------
       - name: Build (Release)
         shell: pwsh
         run: |
-          cmake --build build --config Release --parallel
+          if ($env:GEN_NAME -eq "Ninja") {
+            & cmake --build build --parallel
+          } else {
+            & cmake --build build --config Release --parallel
+          }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "ERROR: Build failed with exit code $LASTEXITCODE" -ForegroundColor Red
+            exit 1
+          }
 
       # ----------------------------------------------------------------
-      # 5. List artefacts so we can see what was produced.
+      # 5. List artefacts.
       # ----------------------------------------------------------------
       - name: List artefacts
         shell: pwsh
@@ -120,7 +160,6 @@ jobs:
           $out = "staging"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
 
-          # VST2 .dll
           $vst = Get-ChildItem -Path build -Recurse -Filter "SSAB.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($vst) {
             Copy-Item $vst.FullName -Destination "$out/SSAB.dll"
@@ -129,7 +168,6 @@ jobs:
             Write-Host "WARNING: SSAB.dll not found!"
           }
 
-          # VST3 bundle
           $vst3 = Get-ChildItem -Path build -Recurse -Filter "SSAB.vst3" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($vst3) {
             New-Item -ItemType Directory -Force -Path "$out/SSAB.vst3" | Out-Null
@@ -137,7 +175,6 @@ jobs:
             Write-Host "Staged VST3: $($vst3.FullName)"
           }
 
-          # Standalone exe
           $exe = Get-ChildItem -Path build -Recurse -Filter "SSAB.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($exe) {
             Copy-Item $exe.FullName -Destination "$out/SSAB.exe"
@@ -148,7 +185,7 @@ jobs:
           Get-ChildItem -Path $out -Recurse | ForEach-Object { Write-Host $_.FullName }
 
       # ----------------------------------------------------------------
-      # 7. Upload artefacts (each as separate downloadable item).
+      # 7. Upload artefacts.
       # ----------------------------------------------------------------
       - name: Upload VST2 .dll (for LMMS)
         uses: actions/upload-artifact@v4
@@ -174,9 +211,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
-      # ----------------------------------------------------------------
-      # 8. Zip everything for a one-click download.
-      # ----------------------------------------------------------------
       - name: Zip everything
         shell: pwsh
         run: |

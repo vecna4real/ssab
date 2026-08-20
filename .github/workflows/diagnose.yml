@@ -2,7 +2,9 @@ name: Diagnose Runner
 
 # Manual workflow that prints what's installed on the Windows runner.
 # Use this if build.yml and build-ninja.yml both fail — the output will
-# show exactly what compilers / CMake / VS installations are available.
+# show exactly what compilers / CMake / VS installations are available,
+# and tries to actually configure the project with the auto-detected
+# generator (using $LASTEXITCODE, not try/catch which masks cmake errors).
 on:
   workflow_dispatch:
 
@@ -44,59 +46,77 @@ jobs:
             $latest = & $vswhere -latest -format json | ConvertFrom-Json
             Write-Host "  Path:    $($latest.installationPath)"
             Write-Host "  Version: $($latest.installationVersion)"
-            $vsMajor = $latest.installationVersion.Split('.')[0]
-            $vsYear  = [int]::Parse($vsMajor) + 2005
+            $vsMajor = [int]::Parse($latest.installationVersion.Split('.')[0])
             Write-Host "  Major:   $vsMajor"
-            Write-Host "  Year:    $vsYear"
-            $genName = "Visual Studio $vsMajor $vsYear"
-            Write-Host "  -> Suggested CMake generator: $genName"
           } else {
             Write-Host "vswhere.exe not found!"
           }
           Write-Host ""
-          Write-Host "=== CMake generators available ==="
-          cmake --help | Select-String -Pattern "^\s+(Visual Studio|Ninja|Unix Makefiles|MSYS|Borland)" | ForEach-Object { Write-Host $_.Line }
+          Write-Host "=== CMake generators available (filtered) ==="
+          cmake --help | Select-String -Pattern "^\s+(Visual Studio|Ninja|Unix Makefiles|MSYS|Borland|NMake)" | ForEach-Object { Write-Host $_.Line }
 
       - name: Setup MSVC
         uses: microsoft/setup-msbuild@v2
         with:
           msbuild-architecture: x64
 
+      # ------------------------------------------------------------------
+      # Try to configure the project using the auto-detected generator.
+      # We check $LASTEXITCODE (NOT try/catch) because cmake prints errors
+      # to stderr but still returns 0 from the PowerShell process.
+      # ------------------------------------------------------------------
       - name: Test CMake configure with auto-detected generator
         shell: pwsh
         run: |
           Write-Host "=== After setup-msbuild ==="
-          Write-Host "vswhere latest:"
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          & $vswhere -latest -property installationPath
-          Write-Host ""
-          Write-Host "MSBuild:"
-          msbuild -version
-          Write-Host ""
-          Write-Host "=== Test CMake configure with auto-detected generator ==="
-
           $vsVersion = & $vswhere -latest -property installationVersion
-          $vsMajor   = $vsVersion.Split('.')[0]
-          $vsYear    = [int]::Parse($vsMajor) + 2005
-          $genName   = "Visual Studio $vsMajor $vsYear"
-          Write-Host "Using generator: $genName"
+          $vsMajor   = [int]::Parse($vsVersion.Split('.')[0])
+          Write-Host "Detected VS version: $vsVersion (major=$vsMajor)"
+          Write-Host ""
 
-          mkdir test_build -Force
-          cd test_build
-          try {
-            cmake .. -G "$genName" -A x64 2>&1 | Out-String | Write-Host
-            Write-Host "SUCCESS: CMake configured with $genName"
-          } catch {
-            Write-Host "ERROR: $_"
-            Write-Host "Trying without -G flag (let CMake auto-pick)..."
-            cd ..
-            Remove-Item -Recurse -Force test_build
-            mkdir test_build -Force
-            cd test_build
-            try {
-              cmake .. -A x64 2>&1 | Out-String | Write-Host
-              Write-Host "SUCCESS: CMake configured with default generator"
-            } catch {
-              Write-Host "ERROR: $_"
-            }
+          # Explicit map — Microsoft breaks the "+2005" pattern at VS 18.
+          $yearMap = @{
+              14 = 2015
+              15 = 2017
+              16 = 2019
+              17 = 2022
+              18 = 2026
+              19 = 2029
+              20 = 2032
           }
+          if ($yearMap.ContainsKey($vsMajor)) {
+              $vsYear = $yearMap[$vsMajor]
+          } else {
+              $vsYear = $vsMajor + 2005
+              Write-Host "WARNING: VS major $vsMajor not in known map. Guessing $vsYear." -ForegroundColor Yellow
+          }
+          $genName = "Visual Studio $vsMajor $vsYear"
+          Write-Host "Trying generator: $genName"
+          Write-Host ""
+
+          # Sanity check: does CMake actually list this generator?
+          $helpOutput = cmake --help | Out-String
+          if ($helpOutput -notmatch [regex]::Escape($genName)) {
+              Write-Host "Generator '$genName' is NOT listed by cmake --help." -ForegroundColor Yellow
+              Write-Host "Trying fallback: Visual Studio 17 2022"
+              $genName = "Visual Studio 17 2022"
+              if ($helpOutput -notmatch [regex]::Escape($genName)) {
+                  Write-Host "VS 2022 generator also missing." -ForegroundColor Yellow
+                  Write-Host "Diagnosis complete: cannot find any VS generator." -ForegroundColor Red
+                  exit 1
+              }
+          }
+          Write-Host "Confirmed: generator '$genName' is listed by CMake." -ForegroundColor Green
+          Write-Host ""
+
+          Write-Host "=== Running: cmake -S . -B test_build -G `"$genName`" -A x64 ==="
+          & cmake -S . -B test_build -G "$genName" -A x64
+          $cmakeExit = $LASTEXITCODE
+          Write-Host ""
+          Write-Host "CMake exit code: $cmakeExit"
+          if ($cmakeExit -ne 0) {
+              Write-Host "FAILED: CMake configure with $genName." -ForegroundColor Red
+              exit 1
+          }
+          Write-Host "SUCCESS: CMake configured with $genName" -ForegroundColor Green
